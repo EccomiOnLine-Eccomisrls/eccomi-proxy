@@ -163,6 +163,31 @@ async def capture_customer(request: Request):
         # rispondiamo 200 comunque per non rompere il front
         return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
 
+# Alias senza /proxy: permette /apps/eccomi/capture-customer anche se il Proxy URL punta a root
+@app.api_route("/capture-customer", methods=["GET", "POST"])
+async def capture_customer_legacy(request: Request):
+    try:
+        data = await request.json()
+    except:
+        data = {}
+    # supporta anche querystring ?cid=...&email=...&tags=Consent:1,Consent:2
+    cid = str(data.get("customer_id") or request.query_params.get("cid") or "")
+    email = (data.get("email") or request.query_params.get("email") or "").strip()
+
+    tags_in = data.get("tags")
+    if not tags_in:
+        qs_tags = request.query_params.get("tags") or ""
+        tags_in = [t for t in qs_tags.split(",") if t]
+
+    ALLOWED = set(os.getenv("ALLOWED_TAGS", "Consent:1,Consent:2,Consent:3,Eccomi:Registered").split(","))
+    tags = [t for t in (tags_in or []) if t in ALLOWED]
+    if not cid or not tags:
+        return {"ok": True, "note": "missing customer_id or no allowed tags"}
+
+    out = await add_customer_tags(cid, tags)  # stessa helper usata dall’altro endpoint
+    return {"ok": out.get("ok", False), "applied": tags, "mode": "legacy"}
+
+
 # --- App Proxy: cattura consensi e applica TAG (ufficiale) ---
 @app.api_route("/proxy/capture-customer", methods=["POST", "GET"])
 async def proxy_capture_customer(req: Request):
