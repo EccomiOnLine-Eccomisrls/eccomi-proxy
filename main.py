@@ -63,6 +63,14 @@ def root(): return {"service":"Eccomi Proxy","health":"/health","capture":"/capt
 @app.get("/health")
 def health(): return {"ok": bool(SHOP_DOMAIN and ADMIN_TOKEN), "domain": SHOP_DOMAIN}
 
+@app.get("/")
+def root():
+    return {"status": "Eccomi Proxy API Running 🚀"}
+
+@app.get("/capture-customer")
+def capture_customer():
+    return {"ok": True, "msg": "Eccomi Proxy READY ✅"}
+
 @app.post("/capture-customer")
 async def capture_customer(req: Request):
     p = await req.json()
