@@ -231,3 +231,36 @@ async def proxy_capture_customer(req: Request):
     except Exception as e:
         # mai 500: rispondiamo 200 con errore per non bloccare il front
         return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+# --- ALIAS senza /proxy: /apps/eccomi/capture-customer -> backend /capture-customer
+from fastapi import HTTPException  # se non l'hai già importato in alto
+
+@app.api_route("/capture-customer", methods=["GET","POST"])
+async def capture_customer_alias(req: Request):
+    # verifica firma App Proxy (Shopify aggiunge ?signature=...)
+    verify_app_proxy_request(str(req.url))
+
+    try:
+        data = await req.json()
+    except:
+        data = {}
+
+    # supporta anche query string (cid, email, tags=Consent:1,Consent:2)
+    cid = str(data.get("customer_id") or req.query_params.get("cid") or "")
+    email = (data.get("email") or req.query_params.get("email") or "").strip()
+
+    tags_in = data.get("tags")
+    if not tags_in:
+        qs_tags = req.query_params.get("tags") or ""
+        tags_in = [t for t in qs_tags.split(",") if t]
+
+    if not cid:
+        return {"ok": False, "error": "missing customer_id"}
+
+    ALLOWED = set(os.getenv("ALLOWED_TAGS", "Consent:1,Consent:2,Consent:3,Eccomi:Registered").split(","))
+    tags = [t for t in (tags_in or []) if t in ALLOWED]
+    if not tags:
+        return {"ok": True, "note": "no tags to apply"}
+
+    out = await add_customer_tags(cid, tags)  # usa l'helper già presente
+    return {"ok": out.get("ok", False), "applied": tags, "mode": "alias"}
