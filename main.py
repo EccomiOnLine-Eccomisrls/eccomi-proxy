@@ -203,10 +203,17 @@ async def capture_customer_proxy(req: Request):
 # ============================================================
 @app.get("/hmac-check")
 async def hmac_check(req: Request):
+    if not VERIFY_APP_PROXY_HMAC:
+        return JSONResponse({
+            "ok": True,
+            "verify_hmac_flag": False,
+            "hint": "verifica HMAC disattivata (debug)"
+        })
+
     ok = verify_app_proxy_request(str(req.url), APP_SHARED_SECRET)
     return JSONResponse({
         "ok": ok,
-        "verify_hmac_flag": VERIFY_APP_PROXY_HMAC,
+        "verify_hmac_flag": True,
         "meta": base_meta(dict(req.query_params)),
         "hint": "firma App Proxy valida" if ok else "firma mancante/non valida"
     })
