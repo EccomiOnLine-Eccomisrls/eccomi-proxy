@@ -75,7 +75,7 @@ def verify_app_proxy_request(full_url: str, shared_secret: str) -> bool:
     if not provided:
         return False
     qs = _sorted_qs_without_signature(params)
-    msg = f"{parsed.path}?{qs}" if qs else f"{parsed.path}?"
+    msg = f"{parsed.path}?{qs}" if qs else f"{parsed.path}"
     digest = hmac.new(
         shared_secret.encode("utf-8"),
         msg.encode("utf-8"),
@@ -83,7 +83,7 @@ def verify_app_proxy_request(full_url: str, shared_secret: str) -> bool:
     ).hexdigest()
     return hmac.compare_digest(digest, provided)
 
-async def add_customer_tag(customer_id_numeric: str, tag: str) -> Dict[str, Any]:
+async def add_customer_tag(customer_id_numeric: str, tags: list[str]) -> Dict[str, Any]:
     """
     Aggiunge un tag al customer via Admin GraphQL.
     """
@@ -99,7 +99,7 @@ async def add_customer_tag(customer_id_numeric: str, tag: str) -> Dict[str, Any]
       }
     }
     """
-    variables = {"id": gid, "tags": [tag]}
+    "variables": {"id": gid, "tags": tags}
     url = f"https://{SHOP_DOMAIN}/admin/api/{SHOPIFY_API_VER}/graphql.json"
     headers = {
         "X-Shopify-Access-Token": SHOP_ADMIN_TOKEN,
@@ -167,11 +167,13 @@ async def handle_capture(req: Request, via: str):
 
     customer_id = extract_customer_id(qp, payload)
     email = qp.get("email") or payload.get("email")
-    tag = qp.get("tag") or DEFAULT_CAPTURE_TAG
+    
+    # ✅ supporta più tag separati da virgola o parametro "tags"
+raw_tags = qp.get("tags") or qp.get("tag") or DEFAULT_CAPTURE_TAG
+tags = [t.strip() for t in str(raw_tags).split(",") if t.strip()]
 
-    tag_result = {}
-    if customer_id:
-        tag_result = await add_customer_tag(customer_id, tag)
+if customer_id:
+    tag_result = await add_customer_tag(customer_id, tags)
 
     response: Dict[str, Any] = {
         "ok": True,
