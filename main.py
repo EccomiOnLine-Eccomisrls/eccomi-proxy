@@ -67,12 +67,15 @@ def _hex_hmac(secret: str, msg: str) -> str:
 
 def verify_app_proxy_request(full_url: str, shared_secret: str) -> Dict[str, Any]:
     """
-    Verifica HMAC App Proxy (super-robusta):
-      A) canonical decodificato e ordinato (k=v&...)
-      B) path + '?' + canonical
-      C) RAW query originale (senza decodifica), ordine invariato
-      D) path + '?' + RAW query
-    Ritorna {"ok":bool, "mode": "A"|"B"|"C"|"D"|None}
+    Verifica HMAC App Proxy super-robusta.
+    Prova in ordine:
+      E) RAW ordinata per chiave:           HMAC(secret, "k=v&k2=v2")
+      F) RAW ordinata + path:               HMAC(secret, "<path>?k=v&k2=v2")
+      C) RAW originale (ordine invariato):  HMAC(secret, "<raw_wo_signature>")
+      D) RAW originale + path:              HMAC(secret, "<path>?<raw_wo_signature>")
+      A) Decodificata/ordinata:             HMAC(secret, "k=v&k2=v2")
+      B) Decodificata/ordinata + path:      HMAC(secret, "<path>?k=v&k2=v2")
+    Dove RAW = query string così com'è (senza decode), mantenendo %2C, %2F, +, ecc.
     """
     if not shared_secret:
         return {"ok": False, "mode": None}
@@ -80,53 +83,55 @@ def verify_app_proxy_request(full_url: str, shared_secret: str) -> Dict[str, Any
     parsed = urlparse(full_url)
     raw_qs = parsed.query or ""
 
-    # estrai signature dalla RAW query senza decodifica
-    # cerchiamo l'ultima occorrenza &signature=... o signature=... all'inizio
+    # --- Estrai signature e lista RAW (k,v) senza decodifica ---
     provided = None
-    parts = raw_qs.split("&") if raw_qs else []
-    kept = []
-    for p in parts:
-        if p.startswith("signature=") and provided is None:
-            provided = p[len("signature="):]
-            continue
-        kept.append(p)
-    raw_wo_sig = "&".join(kept)
-
-    # Se non c'è signature in raw, fallback a parse_qsl
+    raw_pairs: list[tuple[str, str]] = []
+    if raw_qs:
+        for seg in raw_qs.split("&"):
+            if not seg:
+                continue
+            k, _, v = seg.partition("=")
+            if k == "signature" and provided is None:
+                provided = v
+            else:
+                raw_pairs.append((k, v))
     if not provided:
-        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        provided = params.pop("signature", None)
-        if provided is None:
-            return {"ok": False, "mode": None}
-        # canonical decodificato/ordinato
-        canonical = "&".join(f"{k}={v}" for k, v in sorted(params.items(), key=lambda kv: kv[0]))
-    else:
-        canonical = None  # la modalità canonica arriverà solo se servisse
+        return {"ok": False, "mode": None}
 
-    def _hh(msg: str) -> str:
-        return hmac.new(shared_secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    def hh(s: str) -> str:
+        return hmac.new(shared_secret.encode("utf-8"), s.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    # Modalità A/B (decodificato/ordinato)
-    if canonical is not None:
-        comp_a = _hh(canonical)
-        if hmac.compare_digest(comp_a, provided):
-            return {"ok": True, "mode": "A"}
-        msg_b = f"{parsed.path}?{canonical}" if canonical else parsed.path
-        comp_b = _hh(msg_b)
-        if hmac.compare_digest(comp_b, provided):
-            return {"ok": True, "mode": "B"}
+    # Helper costruttori
+    def join_pairs(pairs): return "&".join([f"{k}={v}" for k, v in pairs])
 
-    # Modalità C/D (RAW, ordine invariato, nessuna decodifica)
-    comp_c = _hh(raw_wo_sig)
-    if hmac.compare_digest(comp_c, provided):
+    # E) RAW ordinata per chiave
+    canonical_e = join_pairs(sorted(raw_pairs, key=lambda kv: kv[0]))
+    if hmac.compare_digest(hh(canonical_e), provided):
+        return {"ok": True, "mode": "E"}
+    # F) RAW ordinata + path
+    if hmac.compare_digest(hh(f"{parsed.path}?{canonical_e}" if canonical_e else parsed.path), provided):
+        return {"ok": True, "mode": "F"}
+
+    # C) RAW originale (ordine invariato)
+    canonical_c = join_pairs(raw_pairs)
+    if hmac.compare_digest(hh(canonical_c), provided):
         return {"ok": True, "mode": "C"}
-    msg_d = f"{parsed.path}?{raw_wo_sig}" if raw_wo_sig else parsed.path
-    comp_d = _hh(msg_d)
-    if hmac.compare_digest(comp_d, provided):
+    # D) RAW originale + path
+    if hmac.compare_digest(hh(f"{parsed.path}?{canonical_c}" if canonical_c else parsed.path), provided):
         return {"ok": True, "mode": "D"}
 
-    return {"ok": False, "mode": None}
+    # A/B) Fallback decodificato (come molte guide)
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    prov2 = params.pop("signature", None)
+    if prov2:
+        canonical_a = "&".join(f"{k}={v}" for k, v in sorted(params.items(), key=lambda kv: kv[0]))
+        if hmac.compare_digest(hh(canonical_a), prov2):
+            return {"ok": True, "mode": "A"}
+        if hmac.compare_digest(hh(f"{parsed.path}?{canonical_a}" if canonical_a else parsed.path), prov2):
+            return {"ok": True, "mode": "B"}
 
+    return {"ok": False, "mode": None}
+    
 def require_hmac(req: Request):
     if not VERIFY_APP_PROXY_HMAC:
         return {"skipped": True}
