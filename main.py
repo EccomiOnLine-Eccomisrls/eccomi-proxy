@@ -264,3 +264,46 @@ async def capture_customer_alias(req: Request):
 
     out = await add_customer_tags(cid, tags)  # usa l'helper già presente
     return {"ok": out.get("ok", False), "applied": tags, "mode": "alias"}
+
+# --- echo per test App Proxy ---
+@app.get("/proxy/echo")
+async def proxy_echo(req: Request):
+    verify_app_proxy_request(str(req.url))   # 401 se SECRET errato
+    return {"ok": True, "proxied": True, "qs": dict(req.query_params)}
+
+# --- handler unico per cattura/tag ---
+async def _handle_capture(req: Request):
+    verify_app_proxy_request(str(req.url))   # firma App Proxy
+
+    try:
+        data = await req.json()
+    except:
+        data = {}
+
+    # accetta anche querystring ?cid=..&email=..&tags=Consent:1,Consent:2
+    cid = str(data.get("customer_id") or req.query_params.get("cid") or "")
+    email = (data.get("email") or req.query_params.get("email") or "").strip()
+    tags_in = data.get("tags")
+    if not tags_in:
+        qs_tags = (req.query_params.get("tags") or "")
+        tags_in = [t for t in qs_tags.split(",") if t]
+
+    if not cid:
+        return JSONResponse({"ok": False, "error": "missing customer_id"}, status_code=200)
+
+    ALLOWED = set(os.getenv("ALLOWED_TAGS", "Consent:1,Consent:2,Consent:3,Eccomi:Registered").split(","))
+    tags = [t for t in (tags_in or []) if t in ALLOWED]
+    if "Eccomi:Registered" not in tags:
+        tags.append("Eccomi:Registered")
+
+    out = await add_customer_tags(cid, tags)
+    return JSONResponse({"ok": out.get("ok", False), "applied": tags, "email": email}, status_code=200)
+
+# --- ROTTE che puntano allo stesso handler ---
+@app.api_route("/proxy/capture-customer", methods=["GET","POST"])
+async def capture_customer_proxy(req: Request):
+    return await _handle_capture(req)
+
+@app.api_route("/capture-customer", methods=["GET","POST"])
+async def capture_customer_alias(req: Request):
+    return await _handle_capture(req)
