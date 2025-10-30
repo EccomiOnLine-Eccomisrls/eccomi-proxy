@@ -67,25 +67,31 @@ def _hex_hmac(secret: str, msg: str) -> str:
 
 def verify_app_proxy_request(full_url: str, shared_secret: str) -> Dict[str, Any]:
     """
-    Verifica HMAC App Proxy super-robusta.
-    Prova in ordine:
-      E) RAW ordinata per chiave:           HMAC(secret, "k=v&k2=v2")
-      F) RAW ordinata + path:               HMAC(secret, "<path>?k=v&k2=v2")
-      C) RAW originale (ordine invariato):  HMAC(secret, "<raw_wo_signature>")
-      D) RAW originale + path:              HMAC(secret, "<path>?<raw_wo_signature>")
-      A) Decodificata/ordinata:             HMAC(secret, "k=v&k2=v2")
-      B) Decodificata/ordinata + path:      HMAC(secret, "<path>?k=v&k2=v2")
-    Dove RAW = query string così com'è (senza decode), mantenendo %2C, %2F, +, ecc.
+    Verifica HMAC App Proxy ultra-robusta.
+
+    Proviamo varie combinazioni:
+      - Query RAW (ordine invariato) e Query ordinata (per chiave)
+      - Con e senza 'path' davanti
+      - Path candidati:
+          1) parsed.path (quello che vede il backend, es. /proxy/hmac-check)
+          2) parsed.path senza prefisso '/proxy' (es. /hmac-check)
+          3) path_prefix + parsed.path (es. /apps/eccomi-proxy/proxy/hmac-check)
+          4) path_prefix + (parsed.path senza '/proxy') (es. /apps/eccomi-proxy/hmac-check)
+
+    Restituisce {"ok": bool, "mode": "..."} dove mode indica la combinazione che ha funzionato.
     """
+    import hashlib, hmac
+    from urllib.parse import urlparse, parse_qsl
+
     if not shared_secret:
         return {"ok": False, "mode": None}
 
     parsed = urlparse(full_url)
     raw_qs = parsed.query or ""
 
-    # --- Estrai signature e lista RAW (k,v) senza decodifica ---
+    # --- Estrai signature dalla RAW query senza decodifica ---
     provided = None
-    raw_pairs: list[tuple[str, str]] = []
+    raw_pairs = []
     if raw_qs:
         for seg in raw_qs.split("&"):
             if not seg:
@@ -95,40 +101,75 @@ def verify_app_proxy_request(full_url: str, shared_secret: str) -> Dict[str, Any
                 provided = v
             else:
                 raw_pairs.append((k, v))
+
     if not provided:
-        return {"ok": False, "mode": None}
+        # Fallback: parse decodificato
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        provided = params.pop("signature", None)
+        if not provided:
+            return {"ok": False, "mode": None}
+        # ricostruzione canonical decodificata (useremo più giù)
+        decoded_pairs = sorted(params.items(), key=lambda kv: kv[0])
+    else:
+        # anche versione decodificata/ordinata per completezza
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        params.pop("signature", None)
+        decoded_pairs = sorted(params.items(), key=lambda kv: kv[0])
 
     def hh(s: str) -> str:
         return hmac.new(shared_secret.encode("utf-8"), s.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    # Helper costruttori
-    def join_pairs(pairs): return "&".join([f"{k}={v}" for k, v in pairs])
+    def join_raw(pairs):      return "&".join([f"{k}={v}" for k, v in pairs])
+    def join_decoded(pairs):  return "&".join([f"{k}={v}" for k, v in pairs])
 
-    # E) RAW ordinata per chiave
-    canonical_e = join_pairs(sorted(raw_pairs, key=lambda kv: kv[0]))
-    if hmac.compare_digest(hh(canonical_e), provided):
-        return {"ok": True, "mode": "E"}
-    # F) RAW ordinata + path
-    if hmac.compare_digest(hh(f"{parsed.path}?{canonical_e}" if canonical_e else parsed.path), provided):
-        return {"ok": True, "mode": "F"}
+    # --- Costruiamo i possibili PATH ---
+    path_prefix = None
+    try:
+        # se la query contiene path_prefix, usiamolo
+        for k, v in raw_pairs:
+            if k == "path_prefix":
+                path_prefix = v  # è già RAW (es. /apps/eccomi-proxy)
+                break
+        if path_prefix is None and "path_prefix" in params:
+            path_prefix = params["path_prefix"]
+    except Exception:
+        pass
 
-    # C) RAW originale (ordine invariato)
-    canonical_c = join_pairs(raw_pairs)
-    if hmac.compare_digest(hh(canonical_c), provided):
-        return {"ok": True, "mode": "C"}
-    # D) RAW originale + path
-    if hmac.compare_digest(hh(f"{parsed.path}?{canonical_c}" if canonical_c else parsed.path), provided):
-        return {"ok": True, "mode": "D"}
+    p = parsed.path or ""                       # es. /proxy/hmac-check  oppure /hmac-check
+    p_no_proxy = p[6:] if p.startswith("/proxy") else p  # rimuovi '/proxy' se presente
+    candidates_path = [p]
+    if p_no_proxy != p:
+        candidates_path.append(p_no_proxy)
+    if path_prefix:
+        # /apps/eccomi-proxy + current path
+        candidates_path.append(f"{path_prefix}{p}")
+        # /apps/eccomi-proxy + path senza /proxy
+        if p_no_proxy != p:
+            candidates_path.append(f"{path_prefix}{p_no_proxy}")
 
-    # A/B) Fallback decodificato (come molte guide)
-    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    prov2 = params.pop("signature", None)
-    if prov2:
-        canonical_a = "&".join(f"{k}={v}" for k, v in sorted(params.items(), key=lambda kv: kv[0]))
-        if hmac.compare_digest(hh(canonical_a), prov2):
-            return {"ok": True, "mode": "A"}
-        if hmac.compare_digest(hh(f"{parsed.path}?{canonical_a}" if canonical_a else parsed.path), prov2):
-            return {"ok": True, "mode": "B"}
+    # --- Query candidates (RAW e decodificata) ---
+    q_raw_in_order = join_raw(raw_pairs)                 # C
+    q_raw_sorted   = join_raw(sorted(raw_pairs, key=lambda kv: kv[0]))  # E
+    q_decoded      = join_decoded(decoded_pairs)         # A
+
+    attempts = []
+
+    # Senza path
+    if q_raw_sorted:   attempts.append(("E", q_raw_sorted, None))
+    if q_raw_in_order: attempts.append(("C", q_raw_in_order, None))
+    if q_decoded:      attempts.append(("A", q_decoded, None))
+
+    # Con path candidati
+    for cand_path in candidates_path:
+        if q_raw_sorted:   attempts.append(("F", q_raw_sorted, cand_path))
+        if q_raw_in_order: attempts.append(("D", q_raw_in_order, cand_path))
+        if q_decoded:      attempts.append(("B", q_decoded, cand_path))
+
+    for mode, q, path in attempts:
+        msg = f"{path}?{q}" if path else q
+        comp = hh(msg)
+        if hmac.compare_digest(comp, provided):
+            return {"ok": True, "mode": mode}
 
     return {"ok": False, "mode": None}
     
