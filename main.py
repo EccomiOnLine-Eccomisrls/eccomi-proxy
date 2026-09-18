@@ -828,7 +828,18 @@ async def customer_fiscal_data(
         "logged_in": True,
         "fiscal_data": fiscal_data
     })
+    
+# ============================================================
+# ALIAS PUBBLICO APP PROXY
+# Shopify:
+# /apps/eccomi-proxy/customer-fiscal-data
+# -> Render:
+# /customer-fiscal-data
+# ============================================================
 
+@app.get("/customer-fiscal-data")
+async def customer_fiscal_data_public(req: Request):
+    return await customer_fiscal_data(req)
 
 # ============================================================
 # MAIN LOCAL
