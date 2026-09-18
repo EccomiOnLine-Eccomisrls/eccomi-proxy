@@ -1,5 +1,5 @@
 # ============================================================
-# main.py — Eccomi Proxy v1.9 PRO
+# main.py — Eccomi Proxy v2.0 PRO
 #
 # ESISTENTE:
 # - /capture-customer
@@ -8,13 +8,25 @@
 # - /health
 # - /hmac-check
 #
-# NUOVO — FASE 1 ANAGRAFICA FISCALE:
-# - /proxy/customer-fiscal-data
-# - SOLA LETTURA dei metafield fiscali del cliente loggato
-# - Signature App Proxy OBBLIGATORIA sulla nuova rotta
+# ANAGRAFICA FISCALE CUSTOMER:
+# - GET  /proxy/customer-fiscal-data
+# - POST /proxy/customer-fiscal-data
+# - GET  /customer-fiscal-data
+# - POST /customer-fiscal-data
 #
-# NON scrive dati fiscali.
+# GET:
+# - legge i metafield fiscali del cliente loggato
+#
+# POST:
+# - salva/aggiorna i metafield fiscali del cliente loggato
+#
+# SICUREZZA:
+# - Signature Shopify App Proxy obbligatoria
+# - customer_id preso SOLO da logged_in_customer_id firmato
+#
 # NON modifica il carrello.
+# NON modifica il checkout.
+# NON modifica gli attributi ordine già esistenti.
 # ============================================================
 
 import os
@@ -83,7 +95,7 @@ DEBUG_ECHO = (
 
 app = FastAPI(
     title="Eccomi Proxy",
-    version="1.9.0 PRO"
+    version="2.0.0 PRO"
 )
 
 app.add_middleware(
@@ -107,6 +119,7 @@ def _safe_jsonable(obj: Any):
 
 
 def _split_tags(raw: Any) -> List[str]:
+
     tags = [
         t.strip()
         for t in str(raw or "").split(",")
@@ -115,7 +128,8 @@ def _split_tags(raw: Any) -> List[str]:
 
     if ALLOWED_TAGS:
         tags = [
-            t for t in tags
+            t
+            for t in tags
             if t in ALLOWED_TAGS
         ]
 
@@ -139,13 +153,31 @@ def _customer_id_from(
     ).strip()
 
     return "".join(
-        ch for ch in raw
+        ch
+        for ch in raw
         if ch.isdigit()
     )
 
 
+def _clean_string(
+    value: Any,
+    uppercase: bool = False
+):
+
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    if uppercase:
+        value = value.upper()
+
+    return value if value else None
+
+
 # ============================================================
-# VECCHIA VERIFICA — MANTENUTA PER COMPATIBILITÀ
+# VECCHIA VERIFICA
+# MANTENUTA PER COMPATIBILITÀ CON capture-customer
 # ============================================================
 
 def verify_app_proxy_request(
@@ -179,8 +211,8 @@ def verify_app_proxy_request(
         "hint": "",
     }
 
-    # Manteniamo il comportamento precedente
-    # per NON rompere capture-customer.
+    # Manteniamo questo comportamento esclusivamente
+    # per non rompere il vecchio capture-customer.
     if shop.endswith(SHOP_DOMAIN):
         result["ok"] = True
         result["trusted"] = True
@@ -188,7 +220,6 @@ def verify_app_proxy_request(
     else:
         result["hint"] = "shop_mismatch"
 
-    # Diagnostica HMAC precedente
     if shared_secret and provided:
 
         params = q.copy()
@@ -217,7 +248,9 @@ def verify_app_proxy_request(
     return result
 
 
-def require_hmac_or_trust(req: Request):
+def require_hmac_or_trust(
+    req: Request
+):
 
     if not VERIFY_APP_PROXY_HMAC:
         return {"skipped": True}
@@ -237,8 +270,8 @@ def require_hmac_or_trust(req: Request):
 
 
 # ============================================================
-# NUOVA VERIFICA STRICT APP PROXY
-# Usata SOLO dalla nuova rotta fiscale.
+# STRICT SHOPIFY APP PROXY SIGNATURE
+# USATA PER L'ANAGRAFICA FISCALE
 # ============================================================
 
 def verify_app_proxy_signature_strict(
@@ -251,17 +284,21 @@ def verify_app_proxy_signature_strict(
             detail="SHOPIFY_APP_SHARED_SECRET not configured"
         )
 
-    # Starlette conserva anche eventuali parametri ripetuti.
-    pairs = list(req.query_params.multi_items())
-
+    # Raggruppiamo i parametri per chiave.
+    # Shopify può inviare parametri ripetuti.
+    grouped: Dict[str, List[str]] = {}
     provided_signature = None
-    unsigned_pairs = []
 
-    for key, value in pairs:
+    for key, value in req.query_params.multi_items():
+
         if key == "signature":
             provided_signature = value
-        else:
-            unsigned_pairs.append((key, value))
+            continue
+
+        grouped.setdefault(
+            key,
+            []
+        ).append(value)
 
     if not provided_signature:
         raise HTTPException(
@@ -270,15 +307,23 @@ def verify_app_proxy_signature_strict(
         )
 
     # Shopify App Proxy:
-    # ordiniamo per chiave e costruiamo la message string
-    # senza "&" tra le coppie.
-    unsigned_pairs.sort(
-        key=lambda item: item[0]
-    )
+    # key=value1,value2
+    # ordinati per chiave
+    # concatenati senza "&".
+    message_parts = []
+
+    for key in sorted(grouped.keys()):
+
+        joined_value = ",".join(
+            grouped[key]
+        )
+
+        message_parts.append(
+            f"{key}={joined_value}"
+        )
 
     message = "".join(
-        f"{key}={value}"
-        for key, value in unsigned_pairs
+        message_parts
     )
 
     calculated_signature = hmac.new(
@@ -296,7 +341,10 @@ def verify_app_proxy_signature_strict(
             detail="Invalid App Proxy signature"
         )
 
-    shop = req.query_params.get("shop", "")
+    shop = req.query_params.get(
+        "shop",
+        ""
+    )
 
     if shop != SHOP_DOMAIN:
         raise HTTPException(
@@ -345,6 +393,7 @@ async def shopify_admin_graphql(
     headers = {
         "X-Shopify-Access-Token":
             SHOP_ADMIN_TOKEN,
+
         "Content-Type":
             "application/json",
     }
@@ -368,29 +417,37 @@ async def shopify_admin_graphql(
 
         raise HTTPException(
             status_code=502,
-            detail=f"Shopify connection error: {str(exc)}"
+            detail=(
+                "Shopify connection error: "
+                f"{str(exc)}"
+            )
         )
 
     try:
         data = response.json()
+
     except Exception:
+
         raise HTTPException(
             status_code=502,
             detail="Invalid response from Shopify"
         )
 
     if response.status_code != 200:
+
         raise HTTPException(
             status_code=502,
             detail={
                 "shopify_status":
                     response.status_code,
+
                 "shopify_response":
                     data,
             },
         )
 
     if data.get("errors"):
+
         raise HTTPException(
             status_code=502,
             detail={
@@ -451,73 +508,36 @@ async def add_customer_tags(
         "tags": tags
     }
 
-    url = (
-        f"https://{SHOP_DOMAIN}"
-        f"/admin/api/{SHOPIFY_API_VER}"
-        f"/graphql.json"
-    )
-
-    headers = {
-        "X-Shopify-Access-Token":
-            SHOP_ADMIN_TOKEN,
-        "Content-Type":
-            "application/json"
-    }
-
     try:
 
-        async with httpx.AsyncClient(
-            timeout=30
-        ) as client:
+        data = await shopify_admin_graphql(
+            query,
+            variables
+        )
 
-            resp = await client.post(
-                url,
-                headers=headers,
-                json={
-                    "query": query,
-                    "variables": variables
-                }
-            )
+        errs = (
+            data.get("data", {})
+            .get("tagsAdd", {})
+            .get("userErrors")
+            or []
+        )
 
-            data = resp.json()
+        return {
+            "ok": not errs,
+            "errors": errs,
+            "response": data
+        }
 
-            errs = (
-                data.get(
-                    "data", {}
-                )
-                .get(
-                    "tagsAdd", {}
-                )
-                .get(
-                    "userErrors"
-                )
-                or []
-            )
-
-            return {
-                "ok":
-                    (
-                        resp.status_code == 200
-                        and not errs
-                    ),
-                "status":
-                    resp.status_code,
-                "errors":
-                    errs,
-                "response":
-                    data
-            }
-
-    except Exception as e:
+    except Exception as exc:
 
         return {
             "ok": False,
-            "network_error": str(e)
+            "network_error": str(exc)
         }
 
 
 # ============================================================
-# NUOVO — LETTURA DATI FISCALI CUSTOMER
+# LETTURA DATI FISCALI CUSTOMER
 # ============================================================
 
 async def get_customer_fiscal_data(
@@ -531,6 +551,7 @@ async def get_customer_fiscal_data(
 
     query = """
     query EccomiCustomerFiscalData($id: ID!) {
+
       customer(id: $id) {
 
         id
@@ -575,7 +596,9 @@ async def get_customer_fiscal_data(
 
     data = await shopify_admin_graphql(
         query,
-        {"id": gid}
+        {
+            "id": gid
+        }
     )
 
     customer = (
@@ -584,13 +607,18 @@ async def get_customer_fiscal_data(
     )
 
     if not customer:
+
         raise HTTPException(
             status_code=404,
             detail="Customer not found"
         )
 
-    def mf_value(name: str):
+    def mf_value(
+        name: str
+    ):
+
         item = customer.get(name)
+
         if not item:
             return None
 
@@ -601,7 +629,11 @@ async def get_customer_fiscal_data(
 
         value = str(value).strip()
 
-        return value if value else None
+        return (
+            value
+            if value
+            else None
+        )
 
     return {
         "tipo_cliente":
@@ -622,17 +654,321 @@ async def get_customer_fiscal_data(
 
 
 # ============================================================
+# FASE 2A — SCRITTURA DATI FISCALI CUSTOMER
+# ============================================================
+
+async def set_customer_fiscal_data(
+    customer_id_numeric: str,
+    fiscal_data: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    gid = (
+        f"gid://shopify/Customer/"
+        f"{customer_id_numeric}"
+    )
+
+    metafields = []
+
+    field_map = {
+        "tipo_cliente":
+            "tipo_cliente",
+
+        "codice_fiscale":
+            "codice_fiscale",
+
+        "partita_iva":
+            "partita_iva",
+
+        "codice_sdi":
+            "codice_sdi",
+
+        "pec":
+            "pec",
+    }
+
+    for input_key, metafield_key in field_map.items():
+
+        # Se il campo NON è presente nel JSON,
+        # NON tocchiamo il valore già salvato.
+        if input_key not in fiscal_data:
+            continue
+
+        value = fiscal_data.get(
+            input_key
+        )
+
+        # Normalizzazione.
+        if input_key in (
+            "tipo_cliente",
+            "codice_fiscale",
+            "codice_sdi"
+        ):
+            value = _clean_string(
+                value,
+                uppercase=True
+            )
+
+        else:
+            value = _clean_string(
+                value
+            )
+
+        # In FASE 2A non cancelliamo metafield
+        # tramite stringhe vuote.
+        # Salviamo solo valori effettivamente presenti.
+        if value is None:
+            continue
+
+        metafields.append({
+            "ownerId": gid,
+            "namespace": "eccomi",
+            "key": metafield_key,
+            "type": "single_line_text_field",
+            "value": value,
+        })
+
+    if not metafields:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No fiscal data supplied"
+        )
+
+    mutation = """
+    mutation EccomiSetCustomerFiscalData(
+      $metafields: [MetafieldsSetInput!]!
+    ) {
+
+      metafieldsSet(
+        metafields: $metafields
+      ) {
+
+        metafields {
+          id
+          namespace
+          key
+          value
+          type
+        }
+
+        userErrors {
+          field
+          message
+          code
+        }
+      }
+    }
+    """
+
+    data = await shopify_admin_graphql(
+        mutation,
+        {
+            "metafields":
+                metafields
+        }
+    )
+
+    result = (
+        data.get("data", {})
+        .get("metafieldsSet", {})
+    )
+
+    errors = (
+        result.get("userErrors")
+        or []
+    )
+
+    if errors:
+
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message":
+                    "Unable to save fiscal data",
+
+                "errors":
+                    errors
+            }
+        )
+
+    return {
+        "ok": True,
+        "metafields":
+            result.get("metafields")
+            or []
+    }
+
+
+# ============================================================
+# VALIDAZIONE PAYLOAD FISCALE
+# ============================================================
+
+def validate_fiscal_payload(
+    payload: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    allowed_fields = {
+        "tipo_cliente",
+        "codice_fiscale",
+        "partita_iva",
+        "codice_sdi",
+        "pec",
+    }
+
+    cleaned = {}
+
+    for key in allowed_fields:
+
+        if key in payload:
+            cleaned[key] = payload.get(key)
+
+    if not cleaned:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No valid fiscal fields supplied"
+        )
+
+    # Tipo cliente
+    if "tipo_cliente" in cleaned:
+
+        tipo = _clean_string(
+            cleaned.get("tipo_cliente")
+        )
+
+        if tipo:
+
+            tipo_lower = tipo.lower()
+
+            if tipo_lower not in (
+                "privato",
+                "azienda"
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "tipo_cliente must be "
+                        "'Privato' or 'Azienda'"
+                    )
+                )
+
+            cleaned["tipo_cliente"] = (
+                "Privato"
+                if tipo_lower == "privato"
+                else "Azienda"
+            )
+
+    # Codice fiscale:
+    # validazione formale di 16 caratteri alfanumerici.
+    if "codice_fiscale" in cleaned:
+
+        cf = _clean_string(
+            cleaned.get("codice_fiscale"),
+            uppercase=True
+        )
+
+        if cf:
+
+            if (
+                len(cf) != 16
+                or not cf.isalnum()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Codice Fiscale non valido: "
+                        "sono richiesti 16 caratteri "
+                        "alfanumerici"
+                    )
+                )
+
+            cleaned["codice_fiscale"] = cf
+
+    # Partita IVA:
+    # validazione formale di 11 cifre.
+    if "partita_iva" in cleaned:
+
+        piva = _clean_string(
+            cleaned.get("partita_iva")
+        )
+
+        if piva:
+
+            if (
+                len(piva) != 11
+                or not piva.isdigit()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Partita IVA non valida: "
+                        "sono richieste 11 cifre"
+                    )
+                )
+
+            cleaned["partita_iva"] = piva
+
+    # SDI
+    if "codice_sdi" in cleaned:
+
+        sdi = _clean_string(
+            cleaned.get("codice_sdi"),
+            uppercase=True
+        )
+
+        if sdi:
+
+            if len(sdi) > 7:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Codice SDI non valido"
+                    )
+                )
+
+            cleaned["codice_sdi"] = sdi
+
+    # PEC
+    if "pec" in cleaned:
+
+        pec = _clean_string(
+            cleaned.get("pec")
+        )
+
+        if pec:
+
+            if (
+                "@" not in pec
+                or "." not in pec.split("@")[-1]
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="PEC non valida"
+                )
+
+            cleaned["pec"] = pec.lower()
+
+    return cleaned
+
+
+# ============================================================
 # HANDLER CAPTURE ESISTENTE
 # ============================================================
 
-async def handle_capture(req: Request):
+async def handle_capture(
+    req: Request
+):
 
     try:
         payload = await req.json()
+
     except Exception:
         payload = {}
 
-    qp = dict(req.query_params)
+    qp = dict(
+        req.query_params
+    )
 
     hmac_info = (
         require_hmac_or_trust(req)
@@ -640,7 +976,9 @@ async def handle_capture(req: Request):
             "signature" in qp
             or VERIFY_APP_PROXY_HMAC
         )
-        else {"skipped": True}
+        else {
+            "skipped": True
+        }
     )
 
     customer_id = _customer_id_from(
@@ -659,11 +997,14 @@ async def handle_capture(req: Request):
         or DEFAULT_CAPTURE_TAG
     )
 
-    tags = _split_tags(raw_tags)
+    tags = _split_tags(
+        raw_tags
+    )
 
     tag_result = {}
 
     if customer_id:
+
         tag_result = await add_customer_tags(
             customer_id,
             tags
@@ -671,6 +1012,7 @@ async def handle_capture(req: Request):
 
     resp = {
         "ok": True,
+
         "via":
             "app-proxy"
             if "signature" in qp
@@ -693,122 +1035,60 @@ async def handle_capture(req: Request):
         resp["received"] = {
             "query":
                 _safe_jsonable(qp),
+
             "json":
                 _safe_jsonable(payload)
         }
 
-        resp["hmac"] = hmac_info
+        resp["hmac"] = (
+            hmac_info
+        )
 
-    return JSONResponse(resp)
-
-
-# ============================================================
-# ROUTES
-# ============================================================
-
-@app.get("/")
-async def root():
-
-    return {
-        "service":
-            "Eccomi Proxy",
-
-        "version":
-            "1.9.0 PRO",
-
-        "routes": [
-            "/health",
-            "/hmac-check",
-            "/capture-customer",
-            "/proxy/capture-customer",
-            "/proxy/customer-fiscal-data",
-        ],
-
-        "verify_hmac_enabled":
-            VERIFY_APP_PROXY_HMAC,
-
-        "shop":
-            SHOP_DOMAIN,
-    }
-
-
-@app.get("/health")
-async def health():
-
-    return {
-        "ok": True,
-        "service": "Eccomi Proxy",
-        "version": "1.9.0 PRO",
-        "verify_hmac":
-            VERIFY_APP_PROXY_HMAC,
-        "shop":
-            SHOP_DOMAIN
-    }
-
-
-@app.get("/hmac-check")
-async def hmac_check(req: Request):
-
-    data = verify_app_proxy_request(
-        str(req.url),
-        APP_SHARED_SECRET
+    return JSONResponse(
+        resp
     )
 
-    return JSONResponse(data)
-
-
-@app.api_route(
-    "/capture-customer",
-    methods=["GET", "POST"]
-)
-async def capture_customer_direct(
-    req: Request
-):
-
-    return await handle_capture(req)
-
-
-@app.api_route(
-    "/proxy/capture-customer",
-    methods=["GET", "POST"]
-)
-async def capture_customer_proxy(
-    req: Request
-):
-
-    return await handle_capture(req)
-
 
 # ============================================================
-# NUOVA ROTTA — FASE 1
-# SOLO LETTURA
+# CUSTOMER ID AUTENTICATO DA APP PROXY
 # ============================================================
 
-@app.get(
-    "/proxy/customer-fiscal-data"
-)
-async def customer_fiscal_data(
+def get_logged_customer_id(
     req: Request
-):
+) -> str:
 
-    # Per questa rotta NON usiamo SafeMode.
-    # La signature Shopify deve essere valida.
-    verify_app_proxy_signature_strict(req)
-
-    customer_id = (
+    raw = (
         req.query_params.get(
             "logged_in_customer_id"
         )
         or ""
     ).strip()
 
-    customer_id = "".join(
-        ch for ch in customer_id
+    return "".join(
+        ch
+        for ch in raw
         if ch.isdigit()
     )
 
-    # Cliente non autenticato:
-    # non è un errore applicativo.
+
+# ============================================================
+# HANDLER GET DATI FISCALI
+# ============================================================
+
+async def handle_customer_fiscal_get(
+    req: Request
+):
+
+    verify_app_proxy_signature_strict(
+        req
+    )
+
+    customer_id = (
+        get_logged_customer_id(
+            req
+        )
+    )
+
     if not customer_id:
 
         return JSONResponse({
@@ -826,20 +1106,255 @@ async def customer_fiscal_data(
     return JSONResponse({
         "ok": True,
         "logged_in": True,
-        "fiscal_data": fiscal_data
+        "fiscal_data":
+            fiscal_data
     })
-    
+
+
 # ============================================================
-# ALIAS PUBBLICO APP PROXY
-# Shopify:
+# HANDLER POST DATI FISCALI
+# ============================================================
+
+async def handle_customer_fiscal_post(
+    req: Request
+):
+
+    # PRIMA verifichiamo la firma Shopify.
+    verify_app_proxy_signature_strict(
+        req
+    )
+
+    # L'ID cliente NON viene accettato dal body.
+    # Usiamo esclusivamente quello firmato da Shopify.
+    customer_id = (
+        get_logged_customer_id(
+            req
+        )
+    )
+
+    if not customer_id:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Customer not logged in"
+        )
+
+    try:
+        payload = await req.json()
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON body"
+        )
+
+    if not isinstance(
+        payload,
+        dict
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="JSON body must be an object"
+        )
+
+    cleaned_payload = (
+        validate_fiscal_payload(
+            payload
+        )
+    )
+
+    write_result = (
+        await set_customer_fiscal_data(
+            customer_id,
+            cleaned_payload
+        )
+    )
+
+    # Rileggiamo subito Shopify.
+    # In questo modo il test ci dice cosa
+    # risulta realmente salvato.
+    fiscal_data = (
+        await get_customer_fiscal_data(
+            customer_id
+        )
+    )
+
+    return JSONResponse({
+        "ok": True,
+        "logged_in": True,
+        "saved": True,
+        "write_result":
+            write_result,
+        "fiscal_data":
+            fiscal_data
+    })
+
+
+# ============================================================
+# ROUTES GENERALI
+# ============================================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "service":
+            "Eccomi Proxy",
+
+        "version":
+            "2.0.0 PRO",
+
+        "routes": [
+            "/health",
+            "/hmac-check",
+            "/capture-customer",
+            "/proxy/capture-customer",
+            "/proxy/customer-fiscal-data",
+            "/customer-fiscal-data",
+        ],
+
+        "fiscal_data": {
+            "GET":
+                "read customer fiscal data",
+
+            "POST":
+                "write customer fiscal data"
+        },
+
+        "verify_hmac_enabled":
+            VERIFY_APP_PROXY_HMAC,
+
+        "shop":
+            SHOP_DOMAIN,
+    }
+
+
+@app.get("/health")
+async def health():
+
+    return {
+        "ok": True,
+        "service":
+            "Eccomi Proxy",
+
+        "version":
+            "2.0.0 PRO",
+
+        "verify_hmac":
+            VERIFY_APP_PROXY_HMAC,
+
+        "shop":
+            SHOP_DOMAIN
+    }
+
+
+@app.get("/hmac-check")
+async def hmac_check(
+    req: Request
+):
+
+    data = verify_app_proxy_request(
+        str(req.url),
+        APP_SHARED_SECRET
+    )
+
+    return JSONResponse(
+        data
+    )
+
+
+# ============================================================
+# CAPTURE CUSTOMER — ESISTENTE
+# ============================================================
+
+@app.api_route(
+    "/capture-customer",
+    methods=["GET", "POST"]
+)
+async def capture_customer_direct(
+    req: Request
+):
+
+    return await handle_capture(
+        req
+    )
+
+
+@app.api_route(
+    "/proxy/capture-customer",
+    methods=["GET", "POST"]
+)
+async def capture_customer_proxy(
+    req: Request
+):
+
+    return await handle_capture(
+        req
+    )
+
+
+# ============================================================
+# ROTTA INTERNA APP PROXY — DATI FISCALI
+# ============================================================
+
+@app.get(
+    "/proxy/customer-fiscal-data"
+)
+async def customer_fiscal_data_get(
+    req: Request
+):
+
+    return await handle_customer_fiscal_get(
+        req
+    )
+
+
+@app.post(
+    "/proxy/customer-fiscal-data"
+)
+async def customer_fiscal_data_post(
+    req: Request
+):
+
+    return await handle_customer_fiscal_post(
+        req
+    )
+
+
+# ============================================================
+# ALIAS APP PROXY
+#
+# Shopify storefront:
 # /apps/eccomi-proxy/customer-fiscal-data
-# -> Render:
+#
+# Render:
 # /customer-fiscal-data
 # ============================================================
 
-@app.get("/customer-fiscal-data")
-async def customer_fiscal_data_public(req: Request):
-    return await customer_fiscal_data(req)
+@app.get(
+    "/customer-fiscal-data"
+)
+async def customer_fiscal_data_public_get(
+    req: Request
+):
+
+    return await handle_customer_fiscal_get(
+        req
+    )
+
+
+@app.post(
+    "/customer-fiscal-data"
+)
+async def customer_fiscal_data_public_post(
+    req: Request
+):
+
+    return await handle_customer_fiscal_post(
+        req
+    )
+
 
 # ============================================================
 # MAIN LOCAL
